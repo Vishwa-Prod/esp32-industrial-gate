@@ -1,0 +1,299 @@
+/**
+ * @file gate_controller.ino
+ * @brief Main firmware for Industrial Loading Gate (Scenario 1)
+ * @author Vishwa Abeywickrama
+ * @date 2026-09-24
+ */
+
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>  // Required to disable radio for PIR stability
+
+// ============== PIN DEFINITIONS ==============
+#define PIR_SENSOR_PIN       27  ///< PIR motion sensor input
+#define ULTRASONIC_TRIG_PIN  5   ///< Ultrasonic trigger pin
+#define ULTRASONIC_ECHO_PIN  18  ///< Ultrasonic echo pin
+#define SERVO_PIN            13  ///< PWM servo control pin
+#define BUZZER_PIN           25  ///< Buzzer output pin
+#define POT_PIN              34  ///< Potentiometer ADC input
+#define RESET_BUTTON_PIN     32  ///< Manual reset button input (Active LOW)
+
+// ============== CONSTANTS ==============
+#define SAFETY_DISTANCE_CM   20  ///< Obstacle detection threshold (cm)
+#define GATE_OPEN_ANGLE      90  ///< Fully open servo position
+#define GATE_CLOSED_ANGLE    0   ///< Fully closed servo position
+
+// ============== OLED SETUP ==============
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+Servo gateServo;
+
+// ============== GLOBAL STATE ==============
+enum SystemMode { 
+  IDLE_CLOSED, 
+  OPENING, 
+  HOLD_OPEN, 
+  CLOSING, 
+  SAFETY_HALT,
+  MANUAL_TUNING 
+};
+
+SystemMode current_mode = IDLE_CLOSED;
+int current_angle = GATE_CLOSED_ANGLE;
+unsigned long state_timer = 0;
+unsigned long holdDelayMs = 5000; 
+unsigned long last_debug_print = 0; 
+
+// ==========================================================
+// ============== HELPER FUNCTIONS ==========================
+// ==========================================================
+
+/**
+ * @brief Read ultrasonic sensor distance
+ * @return float Distance in centimeters (returns 999 if timeout)
+ */
+float readUltrasonic() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000); 
+  if (duration == 0) return 999;
+  return duration / 58.0; 
+}
+
+/**
+ * @brief Update I2C OLED with current system status
+ */
+void updateDisplay(const char* line1, const char* line2 = "", const char* line3 = "") {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("GATE SYSTEM");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  display.setTextSize(2);
+  display.setCursor(0, 16);
+  display.println(line1);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.println(line2);
+  display.setCursor(0, 53);
+  display.println(line3);
+  
+  display.display();
+}
+
+/**
+ * @brief Generates a sweeping frequency chirp alarm
+ */
+void chirp() {
+  // Sweeps from 1000Hz to 2000Hz for a dynamic alert tone
+  for (int freq = 1000; freq <= 2000; freq += 250) {
+    unsigned long periodUs = 1000000UL / freq;
+    unsigned long halfPeriodUs = periodUs / 2;
+    unsigned long cycles = (40 * 1000UL) / periodUs; // 40ms duration per frequency step
+    
+    for (unsigned long i = 0; i < cycles; i++) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delayMicroseconds(halfPeriodUs);
+      digitalWrite(BUZZER_PIN, LOW);
+      delayMicroseconds(halfPeriodUs);
+    }
+  }
+}
+
+/**
+ * @brief Actuate servo to target angle with safety interrupts
+ */
+void moveServoWithSafety(int target_angle, int step_delay_ms, bool &halted, bool check_safety) {
+  int dir = (target_angle > current_angle) ? 1 : -1;
+  halted = false;
+  
+  while (current_angle != target_angle) {
+    if (check_safety) {
+      if (readUltrasonic() < SAFETY_DISTANCE_CM) {
+        halted = true;
+        return; 
+      }
+    }
+    current_angle += dir;
+    gateServo.write(current_angle);
+    delay(step_delay_ms);
+  }
+}
+
+/**
+ * @brief Handle serial terminal input for tuning mode selection
+ */
+void handleSerialInput() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "MODE:AUTO") {
+      if (current_mode == MANUAL_TUNING) {
+         gateServo.write(GATE_CLOSED_ANGLE);
+         current_angle = GATE_CLOSED_ANGLE;
+      }
+      current_mode = IDLE_CLOSED;
+      Serial.println("=> Switched to AUTONOMOUS mode");
+    } 
+    else if (command == "MODE:MANUAL") {
+      current_mode = MANUAL_TUNING;
+      Serial.println("=> Switched to MANUAL tuning mode");
+    }
+  }
+}
+
+// ==========================================================
+// ============== MAIN SETUP & LOOP =========================
+// ==========================================================
+
+/**
+ * @brief Initialize hardware, pins, and protocols
+ */
+void setup() {
+  Serial.begin(115200);
+  
+  // Physically disable the Wi-Fi/Bluetooth radio to stop RF interference
+  WiFi.mode(WIFI_OFF); 
+  
+  pinMode(PIR_SENSOR_PIN, INPUT);
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  gateServo.setPeriodHertz(50);
+  // Adjusted limits (1000-2000) prevent mini-servo gear grinding
+  gateServo.attach(SERVO_PIN, 1000, 2000);
+  gateServo.write(GATE_CLOSED_ANGLE);
+
+  Wire.begin(21, 22);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  updateDisplay("READY", "Awaiting vehicle...");
+}
+
+/**
+ * @brief Main state machine and non-blocking event loop
+ */
+void loop() {
+  handleSerialInput();
+
+  // Read potentiometer dynamically (0-4095 mapped to 2000ms - 10000ms)
+  int potRaw = analogRead(POT_PIN);
+  holdDelayMs = map(potRaw, 0, 4095, 2000, 10000);
+
+  // Diagnostic Output: Pushes live sensor data every 1 second
+  if (millis() - last_debug_print >= 1000) {
+    last_debug_print = millis();
+    Serial.print("Mode: "); Serial.print(current_mode);
+    Serial.print(" | PIR: "); Serial.print(digitalRead(PIR_SENSOR_PIN));
+    Serial.print(" | Dist: "); Serial.print(readUltrasonic());
+    Serial.print("cm | Pot RAW: "); Serial.print(potRaw);
+    Serial.print(" | Delay: "); Serial.print(holdDelayMs);
+    Serial.println("ms");
+  }
+
+  switch (current_mode) {
+
+    case IDLE_CLOSED: {
+      updateDisplay("CLOSED", "Waiting for PIR");
+      
+      if (digitalRead(PIR_SENSOR_PIN) == HIGH) {
+        // ELECTRICAL NOISE FILTER (Debounce)
+        delay(500); 
+        
+        if (digitalRead(PIR_SENSOR_PIN) == HIGH) {
+          current_mode = OPENING;
+        } else {
+          Serial.println("Ignored false PIR spike.");
+        }
+      }
+      break;
+    }
+
+    case OPENING: {
+      updateDisplay("OPENING", "Vehicle detected");
+      bool dummy = false; 
+      moveServoWithSafety(GATE_OPEN_ANGLE, 15, dummy, false); 
+      current_mode = HOLD_OPEN;
+      state_timer = millis();
+      break;
+    }
+
+    case HOLD_OPEN: {
+      unsigned long elapsed = millis() - state_timer;
+      bool delayElapsed = elapsed >= holdDelayMs;
+      bool vehicleGone  = (digitalRead(PIR_SENSOR_PIN) == LOW);
+      bool pathClear = (readUltrasonic() >= SAFETY_DISTANCE_CM);
+
+      if (!delayElapsed) {
+        unsigned long remaining = (holdDelayMs - elapsed) / 1000;
+        char buf[20];
+        snprintf(buf, sizeof(buf), "Hold: %lus", remaining);
+        updateDisplay("OPEN", buf);
+      } else {
+        if (vehicleGone && pathClear) {
+          current_mode = CLOSING;
+        } else if (!pathClear) {
+          updateDisplay("OPEN", "Path blocked", "Waiting...");
+        } else if (!vehicleGone) {
+          updateDisplay("OPEN", "Motion detected", "Waiting...");
+        }
+      }
+      break;
+    }
+
+    case CLOSING: {
+      updateDisplay("CLOSING", "Stand clear");
+      bool halted = false;
+      
+      moveServoWithSafety(GATE_CLOSED_ANGLE, 15, halted, true);
+      
+      if (halted) {
+        current_mode = SAFETY_HALT;
+        chirp(); delay(100); chirp(); delay(100); chirp();
+      } else {
+        // 2-second cooldown to isolate the PIR from servo back-EMF
+        updateDisplay("CLOSED", "Cooldown...");
+        delay(2000); 
+        current_mode = IDLE_CLOSED;
+      }
+      break;
+    }
+
+    case SAFETY_HALT: {
+      float dist = readUltrasonic();
+      char buf[20];
+      snprintf(buf, sizeof(buf), "Obstacle: %.0f cm", dist);
+      updateDisplay("!! HALT !!", buf, "Press Reset Btn");
+      
+      // Option C: Manual Reset Button forces human intervention
+      if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+        delay(200); 
+        current_mode = OPENING; 
+      }
+      break;
+    }
+
+    case MANUAL_TUNING: {
+      char buf[20];
+      snprintf(buf, sizeof(buf), "Set Delay: %lus", holdDelayMs / 1000);
+      updateDisplay("TUNING", "Twist Potentiometer", buf);
+      delay(100); 
+      break;
+    }
+  }
+}
